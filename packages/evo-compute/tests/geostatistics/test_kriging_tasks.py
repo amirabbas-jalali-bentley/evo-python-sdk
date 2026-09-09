@@ -42,7 +42,13 @@ from evo.compute.tasks.common import (
     Ellipsoid,
     EllipsoidRanges,
 )
-from evo.compute.tasks.geostatistics.kriging import KrigingParameters
+from evo.compute.tasks.geostatistics.kriging import (
+    RECOMMENDED_DIAGNOSTIC_NAMES,
+    KrigingDiagnostics,
+    KrigingParameters,
+    KrigingResult,
+    KrigingResultModel,
+)
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -575,6 +581,277 @@ class TestKrigingParametersWithFilter(TestCase):
 
         self.assertNotIn("filter", params_dict["target"])
         self.assertNotIn("filter", params_dict["source"])
+
+
+class TestKrigingDiagnostics(TestCase):
+    """Tests for the diagnostics selected on KrigingParameters."""
+
+    def _search(self) -> SearchNeighborhood:
+        return SearchNeighborhood(
+            ellipsoid=Ellipsoid(ranges=EllipsoidRanges(major=100, semi_major=100, minor=50)),
+            max_samples=20,
+        )
+
+    def _params(self, **kwargs) -> KrigingParameters:
+        return KrigingParameters(
+            source=Source(object=POINTSET_URL, attribute="grade"),
+            target=Target.new_attribute(GRID_URL, "kriged_grade"),
+            variogram=VARIOGRAM_URL,
+            search=self._search(),
+            **kwargs,
+        )
+
+    def test_true_uses_the_recommended_name(self):
+        """``True`` selects a diagnostic using its Leapfrog-aligned recommended name."""
+        diagnostics = KrigingDiagnostics(kriging_variance=True, num_samples=True)
+
+        self.assertEqual(diagnostics.kriging_variance, CreateAttribute(name="KV"))
+        self.assertEqual(diagnostics.num_samples, CreateAttribute(name="NS"))
+
+    def test_every_diagnostic_has_a_recommended_name(self):
+        """Every field can be selected with ``True``, so the name table must be complete."""
+        fields = set(KrigingDiagnostics.model_fields)
+
+        self.assertEqual(fields, set(RECOMMENDED_DIAGNOSTIC_NAMES))
+
+        diagnostics = KrigingDiagnostics(**dict.fromkeys(fields, True))
+        for field, expected in RECOMMENDED_DIAGNOSTIC_NAMES.items():
+            self.assertEqual(getattr(diagnostics, field), CreateAttribute(name=expected), field)
+
+    def test_string_creates_an_attribute_with_that_name(self):
+        diagnostics = KrigingDiagnostics(kriging_variance="my_variance")
+
+        self.assertEqual(diagnostics.kriging_variance, CreateAttribute(name="my_variance"))
+
+    def test_false_and_none_select_nothing(self):
+        diagnostics = KrigingDiagnostics(kriging_variance=False, num_samples=None)
+
+        self.assertIsNone(diagnostics.kriging_variance)
+        self.assertIsNone(diagnostics.num_samples)
+
+    def test_existing_attribute_becomes_an_update(self):
+        attr = _create_mock_source_attribute("KV", "kv-key", GRID_URL, schema_path="cell_attributes")
+
+        diagnostics = KrigingDiagnostics(kriging_variance=attr)
+
+        self.assertEqual(diagnostics.kriging_variance, UpdateAttribute(reference="cell_attributes[?key=='kv-key']"))
+
+    def test_pending_attribute_becomes_a_create(self):
+        pending = _create_pending_attribute("KV")
+
+        diagnostics = KrigingDiagnostics(kriging_variance=pending)
+
+        self.assertEqual(diagnostics.kriging_variance, CreateAttribute(name="KV"))
+
+    def test_explicit_specifications_are_kept(self):
+        diagnostics = KrigingDiagnostics(
+            kriging_variance=CreateAttribute(name="KV"),
+            num_samples=UpdateAttribute(reference="attributes[?name=='NS']"),
+        )
+
+        self.assertEqual(diagnostics.kriging_variance, CreateAttribute(name="KV"))
+        self.assertEqual(diagnostics.num_samples, UpdateAttribute(reference="attributes[?name=='NS']"))
+
+    def test_unknown_diagnostic_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            KrigingDiagnostics(variance=True)
+
+    def test_diagnostics_serialize_under_target(self):
+        """Selected diagnostics are nested under ``target.diagnostics`` on the wire."""
+        params = self._params(diagnostics=KrigingDiagnostics(kriging_variance=True, num_samples="sample_count"))
+
+        params_dict = params.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+        self.assertNotIn("diagnostics", params_dict)
+        self.assertEqual(
+            params_dict["target"]["diagnostics"],
+            {
+                "kriging_variance": {"operation": "create", "name": "KV"},
+                "num_samples": {"operation": "create", "name": "sample_count"},
+            },
+        )
+
+    def test_unselected_diagnostics_are_not_sent(self):
+        params = self._params(diagnostics=KrigingDiagnostics(kriging_variance=True))
+
+        diagnostics = params.model_dump(mode="json", by_alias=True, exclude_none=True)["target"]["diagnostics"]
+
+        self.assertEqual(list(diagnostics), ["kriging_variance"])
+
+    def test_diagnostics_can_be_given_as_a_dict(self):
+        params = self._params(diagnostics={"slope_of_regression": True})
+
+        diagnostics = params.model_dump(mode="json", by_alias=True, exclude_none=True)["target"]["diagnostics"]
+
+        self.assertEqual(diagnostics, {"slope_of_regression": {"operation": "create", "name": "SoR"}})
+
+    def test_diagnostics_coexist_with_a_target_filter(self):
+        params = self._params(
+            diagnostics=KrigingDiagnostics(kriging_variance=True),
+            target_filter=Filter(
+                where=FilterCondition(attribute="domain_attribute", operator="in", values=["LMS1"]),
+            ),
+        )
+
+        target = params.model_dump(mode="json", by_alias=True, exclude_none=True)["target"]
+
+        self.assertIn("diagnostics", target)
+        self.assertIn("filter", target)
+
+    def test_params_without_diagnostics_send_nothing(self):
+        params = self._params()
+
+        params_dict = params.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+        self.assertNotIn("diagnostics", params_dict["target"])
+        self.assertNotIn("diagnostics", params_dict)
+
+
+class TestKrigingDiagnosticOutputValidation(TestCase):
+    """Tests that every kriging output writes to its own attribute on the target object."""
+
+    def _params(self, target: Target | None = None, **kwargs) -> KrigingParameters:
+        return KrigingParameters(
+            source=Source(object=POINTSET_URL, attribute="grade"),
+            target=target if target is not None else Target.new_attribute(GRID_URL, "kriged_grade"),
+            variogram=VARIOGRAM_URL,
+            search=SearchNeighborhood(
+                ellipsoid=Ellipsoid(ranges=EllipsoidRanges(major=100, semi_major=100, minor=50)),
+                max_samples=20,
+            ),
+            **kwargs,
+        )
+
+    def test_distinct_outputs_are_accepted(self):
+        params = self._params(diagnostics=KrigingDiagnostics(kriging_variance=True, num_samples=True))
+
+        self.assertEqual(list(params.model_dump()["target"]["diagnostics"]), ["kriging_variance", "num_samples"])
+
+    def test_two_diagnostics_cannot_share_a_name(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self._params(diagnostics=KrigingDiagnostics(kriging_variance=True, kriging_efficiency="KV"))
+
+        self.assertIn("both write to the attribute 'KV'", str(ctx.exception))
+
+    def test_a_diagnostic_cannot_take_the_name_of_the_estimate(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self._params(
+                target=Target.new_attribute(GRID_URL, "KV"),
+                diagnostics=KrigingDiagnostics(kriging_variance=True),
+            )
+
+        self.assertIn("the estimate and diagnostic 'kriging_variance'", str(ctx.exception))
+
+    def test_two_diagnostics_cannot_share_an_update_reference(self):
+        reference = "cell_attributes[?name=='KV']"
+        with self.assertRaises(ValidationError) as ctx:
+            self._params(
+                diagnostics=KrigingDiagnostics(
+                    kriging_variance=UpdateAttribute(reference=reference),
+                    kriging_efficiency=UpdateAttribute(reference=reference),
+                )
+            )
+
+        self.assertIn(f"both write to the attribute {reference!r}", str(ctx.exception))
+
+    def test_a_create_and_an_update_do_not_collide(self):
+        """A name and a reference are separate namespaces, so they are not compared."""
+        params = self._params(
+            diagnostics=KrigingDiagnostics(
+                kriging_variance="KV",
+                kriging_efficiency=UpdateAttribute(reference="KV"),
+            )
+        )
+
+        self.assertEqual(params.diagnostics.kriging_variance, CreateAttribute(name="KV"))
+
+    def test_an_attribute_of_the_target_object_is_accepted(self):
+        attr = _create_mock_source_attribute("KV", "kv-key", GRID_URL, schema_path="cell_attributes")
+
+        params = self._params(diagnostics=KrigingDiagnostics(kriging_variance=attr))
+
+        self.assertEqual(
+            params.diagnostics.kriging_variance,
+            UpdateAttribute(reference="cell_attributes[?key=='kv-key']"),
+        )
+
+    def test_an_attribute_of_another_object_is_rejected(self):
+        attr = _create_mock_source_attribute("KV", "kv-key", POINTSET_URL, schema_path="locations.attributes")
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._params(diagnostics=KrigingDiagnostics(kriging_variance=attr))
+
+        self.assertIn("Diagnostic 'kriging_variance' references an attribute of a different object", str(ctx.exception))
+
+    def test_a_pending_attribute_of_another_object_is_rejected(self):
+        parent = MagicMock()
+        parent.metadata.url = ObjectReference(POINTSET_URL)
+        pending = _create_pending_attribute("KV", parent_obj=parent)
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._params(diagnostics=KrigingDiagnostics(kriging_variance=pending))
+
+        self.assertIn("references an attribute of a different object", str(ctx.exception))
+
+    def test_a_versioned_target_url_still_matches(self):
+        attr = _create_mock_source_attribute("KV", "kv-key", GRID_URL, schema_path="cell_attributes")
+
+        params = self._params(
+            target=Target.new_attribute(f"{GRID_URL}?version=17", "kriged_grade"),
+            diagnostics=KrigingDiagnostics(kriging_variance=attr),
+        )
+
+        self.assertIsNotNone(params.diagnostics.kriging_variance)
+
+    def test_an_attribute_without_a_parent_object_is_not_checked(self):
+        """A standalone block model attribute carries no parent, so it cannot be verified."""
+        attr = BlockModelAttribute(name="KV", attribute_type="Float64")
+
+        params = self._params(diagnostics=KrigingDiagnostics(kriging_variance=attr))
+
+        self.assertEqual(
+            params.diagnostics.kriging_variance,
+            UpdateAttribute(reference="attributes[?name=='KV']"),
+        )
+
+
+class TestKrigingDiagnosticsResult(TestCase):
+    """Tests for the diagnostics returned in a kriging result."""
+
+    def _result(self, diagnostics: dict | None) -> KrigingResult:
+        target = {
+            "reference": GRID_URL,
+            "name": "block model",
+            "schema_id": "/objects/regular-3d-grid/1.2.0/regular-3d-grid.schema.json",
+            "attribute": {"reference": "cell_attributes[?key=='e-key']", "name": "kriged_grade"},
+        }
+        if diagnostics is not None:
+            target["diagnostics"] = diagnostics
+        return KrigingResult(MagicMock(), KrigingResultModel(message="ok", target=target))
+
+    def test_requested_diagnostics_are_exposed(self):
+        """The service returns every key, with ``null`` for diagnostics that were not requested."""
+        result = self._result(
+            {
+                **dict.fromkeys(RECOMMENDED_DIAGNOSTIC_NAMES, None),
+                "kriging_variance": {"reference": "cell_attributes[?key=='kv-key']", "name": "KV"},
+            }
+        )
+
+        self.assertEqual(list(result.diagnostics), ["kriging_variance"])
+        self.assertEqual(result.diagnostics["kriging_variance"].name, "KV")
+        self.assertEqual(result.diagnostics["kriging_variance"].reference, "cell_attributes[?key=='kv-key']")
+
+    def test_no_diagnostics_gives_an_empty_mapping(self):
+        self.assertEqual(self._result(None).diagnostics, {})
+
+    def test_diagnostics_are_listed_in_the_summary(self):
+        result = self._result({"kriging_variance": {"reference": "ref", "name": "KV"}})
+
+        self.assertIn("Diagnostics: KV", str(result))
+
+    def test_summary_omits_diagnostics_when_there_are_none(self):
+        self.assertNotIn("Diagnostics", str(self._result(None)))
 
 
 class TestBlockDiscretisation(TestCase):
